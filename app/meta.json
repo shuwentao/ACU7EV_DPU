@@ -1,0 +1,8 @@
+{
+    "lib": "libvart-dpu-runner.so",
+    "filename": "gate320.xmodel",
+    "kernel": [
+        "subgraph_FaceDetector__FaceDetector_DetHead_heads__ModuleList_0__Conv2d_box__12961"
+    ],
+    "target": "DPUCZDX8G_ISA1_B4096"
+}

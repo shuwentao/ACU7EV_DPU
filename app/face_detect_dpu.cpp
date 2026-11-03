@@ -26,6 +26,9 @@
 #include <signal.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <algorithm>
+#include <cctype>
+#include <opencv2/opencv.hpp>   /* ARM CPU 跑 mobilefacenet 用 cv::dnn */
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
 
@@ -50,6 +53,11 @@
 #define CAM0_H   1080
 #define NBUF_FB  4
 #define BOX_THICK 3
+/* 录入目标区：屏幕中央约 30% 区域（人脸须置于此才允许录入；比原先 50% 更严、更明确） */
+#define ENROLL_ROI_X0 ((int)(0.35f * CAM0_W))
+#define ENROLL_ROI_Y0 ((int)(0.35f * CAM0_H))
+#define ENROLL_ROI_W  ((int)(0.30f * CAM0_W))
+#define ENROLL_ROI_H  ((int)(0.30f * CAM0_H))
 #define V4L_FMT  V4L2_PIX_FMT_BGR24
 #define DRM_FMT_VID  DRM_FORMAT_RGB888
 #define DRM_FMT_GFX  DRM_FORMAT_ARGB8888
@@ -75,6 +83,27 @@ static void*    gfx_map[NBUF_FB] = {nullptr};
 /* 最新检测结果（1080x1080 主相机坐标空间），显示分支读取后画框 */
 static int    g_detected = 0;
 static int32_t g_bx = 0, g_by = 0, g_bw = 0, g_bh = 0;
+
+/* 人脸识别（ARM CPU / OpenCV dnn 跑 mobilefacenet）：最新被识别帧绘到右端 (1081,0) */
+static cv::dnn::Net g_rec_net;
+static std::vector<std::pair<std::string, std::vector<float>>> g_gallery;  /* name + embedding */
+static cv::Mat        g_rec_frame;   /* 最近一次被识别的 320x320 帧(BGR) */
+static std::string    g_rec_label;
+static float          g_rec_sim = 0;
+static int            g_rec_valid = 0;
+static std::string    g_rec_printed;  /* 已播报的识别标签（人脸丢失时由主循环清空，便于重现时重播） */
+static int            g_out_C = 0;   /* 检测模型输出通道数（确认是否含关键点） */
+static float          g_rec_sim_thr = 0.40f;  /* 识别相似度阈值(REC_SIM)：余弦相似度 >= 此值才认出某人 */
+static std::string    g_gallery_path;  /* REC_GALLERY 路径，录入时追加写 */
+static std::string    g_pending_name;  /* 终端输入的待录入姓名（非空即触发录入） */
+static std::string    g_enroll_once;   /* --enroll 一次性录入模式的目标姓名 */
+static int            g_enroll_arming = 0;   /* --enroll 交互模式：等待用户按 Enter 才开始录入 */
+static std::string    g_enroll_arm_name;     /* 待开始录入的姓名 */
+static int            g_enroll_n = 0;  /* 录入累计帧数（非连续，中心稳定即可） */
+static std::vector<float> g_enroll_sum;/* 累计 embedding 之和（末了求平均） */
+static int            g_enroll_cx = 0, g_enroll_cy = 0, g_enroll_refbw = 0; /* 中心稳定基准 */
+static int            g_enroll_last = 0; /* 上一帧采集到的帧号（用于超时复位） */
+static int            g_enrolled_ok = 0; /* 本次运行实际录入成功次数 */
 
 static int set_plane_prop(uint32_t plane_id, const char* name, uint64_t val)
 {
@@ -153,8 +182,8 @@ static int drm_init(void)
      * （drm_dual_plane 39 40 已实测 SetPlane(40) 可显示）。故优先按已知可用 ID 选层，
      * 再用 drmModeGetPlane 逐个校验；都不成再回退全量枚举。可用 VID_PLANE/GFX_PLANE 覆盖。 */
     uint32_t def_vid = 39, def_gfx = 40;
-    if (getenv("VID_PLANE")) def_vid = (uint32_t)atoi(getenv("VID_PLANE"));
-    if (getenv("GFX_PLANE")) def_gfx = (uint32_t)atoi(getenv("GFX_PLANE"));
+    if (getenv("VID_PLANE")) def_vid = (uint32_t)atoi(getenv("VID_PLANE"));   /* 下层视频平面 ID（叠放顺序异常时覆盖） */
+    if (getenv("GFX_PLANE")) def_gfx = (uint32_t)atoi(getenv("GFX_PLANE"));   /* 上层叠加/画框平面 ID */
 
     auto probe = [&](uint32_t id, int* usable, int* has_rgb, int* has_argb, int* type) -> int {
         drmModePlanePtr p = drmModeGetPlane(drm_fd, id);
@@ -358,14 +387,14 @@ static int grab_video0(int* fi)
     return 0;   /* 还回采集队列由 show_frame 处理（零拷贝/兜底路径不同） */
 }
 
-/* 在 GFX 帧缓冲上画绿框（坐标已是 1080x1080 主相机空间，裁剪到 video0 区）。
- * ARGB8888 内存字节序为 B,G,R,A；绿色(R=255,G=255,B=0) 不透明(A=255) 写为 (0,255,255,255)。 */
-static void draw_box_argb(uint8_t* base, int pitch, int x, int y, int w, int h)
+/* 在 GFX 帧缓冲上画矩形（坐标已是 1080x1080 主相机空间）。
+ * ARGB8888 内存字节序为 B,G,R,A。 */
+static void draw_rect_argb(uint8_t* base, int pitch, int x, int y, int w, int h, uint8_t R, uint8_t G, uint8_t B, uint8_t A)
 {
     auto setpx = [&](int px, int py) {
         if (px < 0 || py < 0 || px >= CAM0_W || py >= CAM0_H) return;
         uint8_t* p = base + (size_t)py * pitch + (size_t)px * 4;
-        p[0] = 0; p[1] = 255; p[2] = 255; p[3] = 255;
+        p[0] = B; p[1] = G; p[2] = R; p[3] = A;
     };
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
@@ -376,6 +405,12 @@ static void draw_box_argb(uint8_t* base, int pitch, int x, int y, int w, int h)
     for (int yy = y; yy < y + h; yy++)
         for (int xx = x; xx < x + w; xx++)
             if (xx < x + t || xx >= x + w - t || yy < y + t || yy >= y + h - t) setpx(xx, yy);
+}
+
+/* 绿框：检测/识别到的人脸（真正绿色 R=0,G=255,B=0） */
+static void draw_box_argb(uint8_t* base, int pitch, int x, int y, int w, int h)
+{
+    draw_rect_argb(base, pitch, x, y, w, h, 0, 255, 0, 255);
 }
 
 /* 零拷贝：把指定 DP dumb buffer（已作为 dmabuf 导入 V4L2）还回采集队列 */
@@ -392,6 +427,7 @@ static void zc_qbuf_video0(unsigned idx)
 /* 显示一帧：video0 拷进 VID 层 + 框画进 GFX 层，均 DIRTYFB 后 SetPlane */
 static int g_fi = 0;
 static int g_disp_v0 = -1;   /* 零拷贝：当前显示在 VID 平面的缓冲索引（持有，下一帧替换时才还回相机，防撕裂） */
+static void blit_bgr_to_gfx(uint8_t* gfx, int gpitch, const cv::Mat& img, int ox, int oy);  /* 前向声明：识别缩略图贴 GFX */
 static void show_frame(int v0_idx)
 {
     /* VID 层：零拷贝 = 相机已把帧 DMA 写进 DP dumb buffer，直接 SetPlane(vid_fb[fi])；
@@ -427,6 +463,11 @@ static void show_frame(int v0_idx)
     /* GFX 层：先整帧清透明，再画框（若检测到） */
     memset(gfx_map[g_fi], 0, gfx_size[g_fi]);
     if (g_detected) draw_box_argb((uint8_t*)gfx_map[g_fi], (int)gfx_pitch[g_fi], g_bx, g_by, g_bw, g_bh);
+    /* 录入(含待开始)时画白色目标区，提示人脸须放屏幕中央 */
+    if (!g_enroll_once.empty() || !g_pending_name.empty() || g_enroll_arming)
+        draw_rect_argb((uint8_t*)gfx_map[g_fi], (int)gfx_pitch[g_fi],
+                       ENROLL_ROI_X0, ENROLL_ROI_Y0, ENROLL_ROI_W, ENROLL_ROI_H, 255, 255, 255, 200);
+    /* 右端缩略图已关闭：识别结果改由日志打印（见 do_recognition 的 [rec] 识别到:） */
     drmModeDirtyFB(drm_fd, gfx_fb[g_fi], NULL, 0);
     if (drmModeSetPlane(drm_fd, g_gfx_plane_id, g_crtc_id, gfx_fb[g_fi], 0,
                         0, 0, (uint32_t)SCREEN_W, (uint32_t)SCREEN_H,
@@ -585,7 +626,164 @@ static void resize_bgr(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw,
     }
 }
 
-struct Det { float x1, y1, x2, y2, score; };
+struct Det { float x1, y1, x2, y2, score; float lmk[5][2]; int has_lmk; };
+
+/* 关键点合理性校验：模型输出关键点时，要求 5 点都大致落在检测框内。
+ * 误检/噪声框的关键点常常跑到框外或乱飞，借此过滤（真实人脸的 5 点必在框内）。 */
+static bool lmk_in_box(const Det& d)
+{
+    if (!d.has_lmk) return false;
+    float mx = (d.x2 - d.x1) * 0.6f, my = (d.y2 - d.y1) * 0.6f;
+    for (int k = 0; k < 5; k++) {
+        float lx = d.lmk[k][0], ly = d.lmk[k][1];
+        if (lx < d.x1 - mx || lx > d.x2 + mx || ly < d.y1 - my || ly > d.y2 + my) return false;
+    }
+    return true;
+}
+
+/* ---------------- 人脸识别（ARM CPU / OpenCV dnn） ---------------- */
+static float cosine(const std::vector<float>& a, const std::vector<float>& b)
+{
+    if (a.size() != b.size() || a.empty()) return -1.0f;
+    double dot = 0, na = 0, nb = 0;
+    for (size_t i = 0; i < a.size(); i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+    if (na <= 0 || nb <= 0) return -1.0f;
+    return (float)(dot / (std::sqrt(na) * std::sqrt(nb)));
+}
+
+/* gallery 文件：每行 "名字 f0 f1 ... fN"（embedding） */
+static void load_gallery(const std::string& path)
+{
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) { fprintf(stderr, "[rec] 无 gallery 文件 %s，识别仅输出 Unknown\n", path.c_str()); return; }
+    char line[16384];
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        char name[256] = {0}; int ni = 0;
+        while (*p && !isspace((unsigned char)*p) && ni < 255) name[ni++] = *p++;
+        name[ni] = 0;
+        std::vector<float> emb; float v; int n = 0;
+        while (*p) {
+            if (sscanf(p, "%f%n", &v, &n) == 1) { emb.push_back(v); p += n; } else p++;
+        }
+        if (!emb.empty()) g_gallery.emplace_back(name, emb);
+    }
+    fclose(f);
+    fprintf(stderr, "[rec] gallery 载入 %zu 条\n", g_gallery.size());
+}
+
+/* 把 BGR(cv::Mat) 以不透明方式贴到 GFX(ARGB) 缓冲的 (ox,oy) */
+static void blit_bgr_to_gfx(uint8_t* gfx, int gpitch, const cv::Mat& img, int ox, int oy)
+{
+    int w = img.cols, h = img.rows;
+    if (w <= 0 || h <= 0) return;
+    for (int y = 0; y < h; y++) {
+        const uint8_t* s = img.data + (size_t)y * img.step;
+        uint8_t* d = gfx + ((size_t)(oy + y) * gpitch + (size_t)ox * 4);
+        for (int x = 0; x < w; x++) {
+            const uint8_t* p = s + (size_t)x * 3;
+            d[x*4+0] = p[0]; d[x*4+1] = p[1]; d[x*4+2] = p[2]; d[x*4+3] = 255;  /* B,G,R,A */
+        }
+    }
+}
+
+/* 仿射对齐112x112 → mobilefacenet → 返回 L2 归一化 embedding（失败返回空） */
+static std::vector<float> compute_embedding(const uint8_t* bgr320, int W, int H, const Det& best)
+{
+    if (g_rec_net.empty()) return {};
+    cv::Mat bgr_mat(H, W, CV_8UC3, (void*)bgr320);
+    cv::Mat face112;
+    if (best.has_lmk) {
+        /* 关键点归一为 [左眼,右眼,鼻,左嘴角,右嘴角]：最上两点为眼(按x排序)，最下两点为嘴(按x排序)，余下为鼻 */
+        int order[5] = {0,1,2,3,4};
+        std::sort(order, order + 5, [&](int a, int b){ return best.lmk[a][1] < best.lmk[b][1]; });
+        if (best.lmk[order[0]][0] > best.lmk[order[1]][0]) std::swap(order[0], order[1]);
+        if (best.lmk[order[3]][0] > best.lmk[order[4]][0]) std::swap(order[3], order[4]);
+        float lm[5][2];
+        for (int i = 0; i < 5; i++) { lm[i][0] = best.lmk[order[i]][0]; lm[i][1] = best.lmk[order[i]][1]; }
+
+        static const float ref[5][2] = { {38.2946f,51.6963f},{73.5318f,51.6963f},{56.0252f,102.453f},{41.5493f,165.729f},{70.7299f,165.729f} };
+        std::vector<cv::Point2f> src, dst;
+        for (int i = 0; i < 5; i++) { src.emplace_back(lm[i][0], lm[i][1]); dst.emplace_back(ref[i][0], ref[i][1]); }
+        cv::Mat M = cv::estimateAffinePartial2D(src, dst);
+        if (M.empty()) return {};
+        cv::warpAffine(bgr_mat, face112, M, cv::Size(112,112), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+    } else {
+        /* 无关键点：用检测框中心裁剪到 112x112（对齐精度低，但能正常录入/识别） */
+        int cx = (int)((best.x1 + best.x2) * 0.5f);
+        int cy = (int)((best.y1 + best.y2) * 0.5f);
+        int side = (int)std::max(best.x2 - best.x1, best.y2 - best.y1);
+        if (side <= 0) return {};
+        int x0 = cx - side/2, y0 = cy - side/2;
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        int x1 = x0 + side, y1 = y0 + side;
+        if (x1 > W) { x1 = W; x0 = x1 - side; }
+        if (y1 > H) { y1 = H; y0 = y1 - side; }
+        cv::Rect r(x0, y0, x1 - x0, y1 - y0);
+        if (r.width <= 0 || r.height <= 0) return {};
+        cv::resize(bgr_mat(r), face112, cv::Size(112,112), 0, 0, cv::INTER_LINEAR);
+    }
+
+    /* 预处理 (img-127.5)/128，转 RGB（mobilefacenet 训练域） */
+    cv::Mat rgb; cv::cvtColor(face112, rgb, cv::COLOR_BGR2RGB);
+    cv::Mat blob = cv::dnn::blobFromImage(rgb, 1.0f/128.0f, cv::Size(), cv::Scalar(127.5f,127.5f,127.5f), false, false);
+    g_rec_net.setInput(blob);
+    cv::Mat feat = g_rec_net.forward();
+    cv::Mat fv32; feat.convertTo(fv32, CV_32F); fv32 = fv32.reshape(1, 1);
+    cv::normalize(fv32, fv32, 1.0, 0.0, cv::NORM_L2);
+    return std::vector<float>((float*)fv32.data, (float*)fv32.data + fv32.total());
+}
+
+/* 检测到脸且有5关键点：取embedding → 与gallery比对 → 存缩略图 */
+static void do_recognition(const uint8_t* bgr320, int W, int H, const Det& best, int dbg)
+{
+    if (g_rec_net.empty()) return;
+    std::vector<float> fv = compute_embedding(bgr320, W, H, best);
+    if (fv.empty()) return;
+
+    g_rec_label = "Unknown"; g_rec_sim = -1.0f;
+    float best_sim = -1.0f; std::string best_name;
+    for (auto& g : g_gallery) {
+        float s = cosine(g.second, fv);
+        if (s > best_sim) { best_sim = s; best_name = g.first; }
+    }
+    float sim_thr = g_rec_sim_thr;
+    if (!g_gallery.empty() && best_sim >= sim_thr) { g_rec_label = best_name; g_rec_sim = best_sim; }
+
+    /* 识别到已知人时打印一次（标签变化才打，避免每帧刷屏）；人脸确实丢失(detected==0)时由主循环清空 g_rec_printed，
+     * 这样同一个人每次重新出现都会重新播报。 */
+    if (g_rec_label != "Unknown") {
+        if (g_rec_label != g_rec_printed)
+            printf("[rec] 识别到: %s (sim=%.2f)\n", g_rec_label.c_str(), g_rec_sim);
+        g_rec_printed = g_rec_label;
+    } else {
+        g_rec_printed.clear();
+    }
+
+    cv::Mat bgr_mat(H, W, CV_8UC3, (void*)bgr320);
+    g_rec_frame = bgr_mat.clone();   /* 当前检测帧（缩略图已关闭，仅作调试保留） */
+    g_rec_valid = 1;
+    if (dbg) {
+        float nn = 0; for (float v : fv) nn += v * v;
+        printf("[rec] sim=%.3f label=%s feat_norm=%.3f\n", g_rec_sim, g_rec_label.c_str(), sqrtf(nn));
+    }
+}
+
+/* 录入：把 name + embedding 追加写进 gallery 文件，并加入内存库（后续立即可识别） */
+static void enroll_face(const std::string& name, const std::vector<float>& fv)
+{
+    if (name.empty() || fv.empty()) return;
+    g_gallery.emplace_back(name, fv);
+    FILE* f = fopen(g_gallery_path.c_str(), "a");
+    if (!f) { fprintf(stderr, "[enroll] 无法写 gallery %s\n", g_gallery_path.c_str()); return; }
+    fprintf(f, "%s", name.c_str());
+    for (float v : fv) fprintf(f, " %.6g", v);
+    fprintf(f, "\n");
+    fclose(f);
+    fprintf(stderr, "[enroll] 已录入 '%s' (dim=%zu)，当前库 %zu 人\n", name.c_str(), fv.size(), g_gallery.size());
+    g_enrolled_ok++;
+}
 
 int main(int argc, char** argv)
 {
@@ -597,37 +795,128 @@ int main(int argc, char** argv)
         for (const char* p = s; *p; p++) if (*p < '0' || *p > '9') return false;
         return true;
     };
-    if (argc < 2 || is_digits(argv[1])) {
+
+    /* 一次性录入模式: face_detect_dpu --enroll <姓名> <模型> [相机(默认/dev/video1)] */
+    int enroll_mode = 0;
+    std::string enroll_name;
+    if (argc >= 3 && std::string(argv[1]) == "--enroll") {
+        enroll_mode = 1; enroll_name = argv[2];
+    }
+
+    if ((!enroll_mode && (argc < 2 || is_digits(argv[1]))) || (enroll_mode && argc < 3)) {
         fprintf(stderr,
-            "用法: face_detect_dpu <模型目录或.xmodel> [相机设备(默认/dev/video1)] [阈值]\n"
-            "示例: face_detect_dpu /usr/share/vart/face_detector/gate320.xmodel /dev/video1\n"
+            "用法:\n"
+            "  显示+识别 : face_detect_dpu <模型目录或.xmodel> [相机(默认/dev/video1)] [阈值]\n"
+            "  录入人脸 : face_detect_dpu --enroll <姓名> <模型> [相机]\n"
+            "示例:\n"
+            "  face_detect_dpu /usr/share/vart/face_detector/gate320.xmodel /dev/video1\n"
+            "  face_detect_dpu --enroll Zhang_San /usr/share/vart/face_detector/gate320.xmodel /dev/video1\n"
             "注意: 平面 ID(如 39 40)由程序自动探测，不要再手动传。\n");
         return 2;
     }
 
-    const char* model_dir = argv[1];
-    const char* cam_dev  = (argc > 2) ? argv[2] : "/dev/video1";
+    const char* model_dir = enroll_mode ? argv[3] : argv[1];
+    const char* cam_dev  = enroll_mode ? ((argc > 4) ? argv[4] : "/dev/video1")
+                                      : ((argc > 2) ? argv[2] : "/dev/video1");
+    if (enroll_mode) g_enroll_once = enroll_name;
+
+    /* ============================================================================
+     *  全部可配置参数
+     * ----------------------------------------------------------------------------
+     *  一、命令行参数
+     *    显示+识别 : face_detect_dpu <模型(.xmodel或目录)> [相机(默认/dev/video1)] [检测阈值]
+     *    录入人脸 : face_detect_dpu --enroll <姓名> <模型> [相机]
+     *    注：非录入模式的第 3 个位置参数等价于 FACE_THR（环境变量优先于位置参数）。
+     *
+     *  二、环境变量（均可不重编直接覆盖；启动时"配置"区会打印生效值）
+     *    变量        默认                              说明
+     *    ----------- --------------------------------- -------------------------------
+     *    FACE_THR    0.40     检测/绿框门槛；分数≥它才算"有人脸"，也决定要不要跑识别(mobilefacenet)
+     *    ENROLL_THR  0.55     录入分数门槛；背景噪声≤0.45、真脸≥0.6，取中间：噪声被挡、真脸必过
+     *    REC_SIM     0.40     识别余弦相似度决策阈值；≥它才认出某人，否则判 Unknown（调高更严）
+     *    DET_OFF     未设置   去抖迟滞开关：设置(非空)=关(每帧直接判定)，未设置=开(连续N帧确认)
+     *    DET_NDET    1        去抖开时，连续多少帧有脸才确认"出现"
+     *    DET_NLOST   5        去抖开时，连续多少帧无脸才确认"消失"
+     *    DET_SMOOTH  0.35     绿框时间平滑(EMA)系数：越大跟手越紧、越小越稳；0=关平滑(画原始框)
+     *    REC_MODEL   /root/tmp/face_rec/deploy/mobilefacenet.onnx   识别模型(.onnx)
+     *    REC_GALLERY /root/tmp/face_rec/gallery.txt                已知人库(录入时追加写)
+     *    VID_PLANE   39        VID(下层视频) DRM 平面 ID；叠放顺序异常时改
+     *    GFX_PLANE   40        GFX(上层叠加/画框) DRM 平面 ID
+     *    VID_ZC      未设置    设置即启用 video0 零拷贝(DP dumb buffer → dmabuf)
+     *    DBG         未设置    设置即打印每帧识别细节(sim / feat_norm)
+     * ========================================================================== */
     int dbg = getenv("DBG") ? 1 : 0;
     float score_thr = 0.40f;
-    if (argc > 3) score_thr = (float)atof(argv[3]);
-    else if (getenv("FACE_THR")) score_thr = (float)atof(getenv("FACE_THR"));
+    if (!enroll_mode && argc > 3) score_thr = (float)atof(argv[3]);
+    if (getenv("FACE_THR")) score_thr = (float)atof(getenv("FACE_THR"));   /* 环境变量始终优先 */
+    /* 录入门槛：仅当检测分数 >= 此值才允许录入。背景噪声最高约 0.45，真实人脸一般 >=0.60，
+     * 故默认取中间值 0.55（噪声被挡、真脸必过）。可用 ENROLL_THR 环境变量覆盖。 */
+    float enroll_thr = getenv("ENROLL_THR") ? (float)atof(getenv("ENROLL_THR")) : 0.55f;
+    g_rec_sim_thr = getenv("REC_SIM") ? (float)atof(getenv("REC_SIM")) : 0.40f;   /* 识别相似度阈值(全局，供打印与识别共用) */
 
-    /* 去抖迟滞（我主动加的稳定逻辑）可配：DET_OFF=1 直接按阈值开关；否则连续 N_DET 帧确认出现 / N_LOST 帧确认消失 */
-    int det_off = getenv("DET_OFF") ? 1 : 0;
-    int n_det  = getenv("DET_NDET")  ? atoi(getenv("DET_NDET"))  : 3;
+    /* 去抖迟滞（我主动加的稳定逻辑）可配：DET_OFF=1 时去掉迟滞（仍受 score_thr 控制）；
+     * 否则连续 N_DET 帧确认出现 / N_LOST 帧确认消失。注意看值，DET_OFF=0 才真正关。 */
+    int det_off = (getenv("DET_OFF") && atoi(getenv("DET_OFF")) != 0) ? 1 : 0;
+    int n_det  = getenv("DET_NDET")  ? atoi(getenv("DET_NDET"))  : 1;   /* 默认 1 帧即出框，避免"没绿框" */
     int n_lost = getenv("DET_NLOST") ? atoi(getenv("DET_NLOST")) : 5;
+    /* 框时间平滑系数(EMA)：越大跟手越紧、越小越稳；0 表示关平滑（画原始框） */
+    float smooth_a = getenv("DET_SMOOTH") ? (float)atof(getenv("DET_SMOOTH")) : 0.35f;
+
+    /* 人脸识别模型（mobilefacenet.onnx）与 gallery 加载（ARM CPU / OpenCV dnn） */
+    std::string rec_model = getenv("REC_MODEL") ? getenv("REC_MODEL") : "/root/tmp/face_rec/deploy/mobilefacenet.onnx";
+    try { g_rec_net = cv::dnn::readNetFromONNX(rec_model); }
+    catch (...) { g_rec_net = cv::dnn::Net(); }
+    if (g_rec_net.empty())
+        fprintf(stderr, "[rec] 警告: 未加载识别模型 %s（将只检测，不识别）\n", rec_model.c_str());
+    else
+        fprintf(stderr, "[rec] 识别模型已加载: %s\n", rec_model.c_str());
+    g_gallery_path = getenv("REC_GALLERY") ? getenv("REC_GALLERY") : "/root/tmp/face_rec/gallery.txt";
+    load_gallery(g_gallery_path);
 
     fprintf(stderr, "[DBG-VER] face_detect_dpu MERGE_GFX (单进程: 双路同流 + GFX 叠层画框)\n");
-    fprintf(stderr, "[DBG] argv: model_dir=%s cam_dev=%s dbg=%d score_thr=%.2f\n",
-            model_dir, cam_dev, dbg, score_thr);
+    if (enroll_mode)
+        fprintf(stderr,
+            "==== 配置(录入模式) ====\n"
+            "  模型     : %s\n  相机     : %s\n  录入姓名 : %s\n"
+            "  FACE_THR : %.2f\n  ENROLL_THR: %.2f (录入门槛)\n  REC_SIM  : %.2f (识别相似度阈值)\n"
+            "  识别模型 : %s\n  gallery  : %s (%zu 人)\n"
+            "========================\n",
+            model_dir, cam_dev, enroll_name.c_str(),
+            score_thr, enroll_thr, g_rec_sim_thr,
+            rec_model.c_str(), g_gallery_path.c_str(), g_gallery.size());
+    else
+        fprintf(stderr,
+            "==== 配置 ====\n"
+            "  模型     : %s\n  相机     : %s\n  FACE_THR : %.2f\n  ENROLL_THR: %.2f (录入门槛)\n"
+            "  DET_OFF  : %d (0=去抖开)\n  DET_NDET : %d  DET_NLOST: %d\n"
+            "  DET_SMOOTH: %.2f (框平滑系数,0=关)\n"
+            "  VID_ZC   : %d\n  DBG      : %d\n"
+            "  识别模型 : %s%s\n  gallery  : %s (%zu 人)\n  REC_SIM  : %.2f (识别相似度阈值)\n"
+            "  右端缩略图: 已关闭(识别结果打印到日志 [rec] 识别到:)\n"
+            "====================\n",
+            model_dir, cam_dev, score_thr, enroll_thr,
+            det_off, n_det, n_lost,
+            smooth_a,
+            (getenv("VID_ZC") ? 1 : 0), dbg,
+            rec_model.c_str(), g_rec_net.empty() ? " (未加载!)" : "",
+            g_gallery_path.c_str(), g_gallery.size(),
+            g_rec_sim_thr);
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    /* === 显示初始化 + 两路相机同时 STREAMON（在慢速 DPU 编译之前，确保双路同流锁定时序） === */
-    if (drm_init() < 0) return 1;
-    if (make_fbs() < 0) return 1;
-    if (v0_open() < 0) return 1;                       /* video0 STREAMON */
+    /* === 显示初始化 + 两路相机同时 STREAMON（在慢速 DPU 编译之前，确保双路同流锁定时序） ===
+     * 录入模式也照常显示（便于对准人脸）；DRM 不可用时降级为无显示运行（仍可检测/录入）。 */
+    if (drm_init() < 0)
+        fprintf(stderr, "warn: DRM 初始化失败，将无显示运行（仍可检测/录入；如需画面请确认 root 与 /dev/dri/card0）\n");
+    else if (make_fbs() < 0) {
+        fprintf(stderr, "warn: make_fbs 失败，无显示运行\n"); drm_fd = -1;
+    } else if (v0_open() < 0) {
+        fprintf(stderr, "warn: video0 打开失败，无显示视频源（DRM 仍可用）\n");
+    }
+    if (drm_fd >= 0)
+        fprintf(stderr, "[DBG] drm: fd=%d crtc=%u conn=%u vid_plane=%u gfx_plane=%u\n",
+                drm_fd, g_crtc_id, g_conn_id, g_vid_plane_id, g_gfx_plane_id);
 
     /* video1 在 runner 创建前以固定 320 开流（锁时序）；Msz 随后从 runner 推导 */
     Cap cap;
@@ -700,12 +989,25 @@ int main(int argc, char** argv)
     }
     fprintf(stderr, "[DBG] 模型输入 Msz=%d nhwc=%d in_fix=%d\n", Msz, (int)nhwc, in_fix);
 
-    /* === 点亮 CRTC（在 GFX 透明 fb 上）+ 关 GFX 的 global alpha（启用逐像素 alpha） === */
-    if (drmModeSetCrtc(drm_fd, g_crtc_id, gfx_fb[0], 0, 0, &g_conn_id, 1, &g_mode) < 0)
-        fprintf(stderr, "warn: SetCrtc failed: %s\n", strerror(errno));
-    else
-        printf("crtc enabled: %dx%d@%u\n", g_screen_w, g_screen_h, g_mode.vrefresh);
-    {
+    /* === 点亮 CRTC（在 GFX 透明 fb 上）+ 关 GFX 的 global alpha（启用逐像素 alpha） ===
+     * 仅在 CRTC 当前未激活时才 SetCrtc：避免与板子已有的显示管理(控制台/Weston)冲突或
+     * 因缺少 DRM master 而失败。若 CRTC 已激活，跳过即可——下面 SetPlane 仍能叠加显示。 */
+    if (drm_fd < 0) {
+        fprintf(stderr, "ERROR: drm_fd 无效(%d)，DRM 未初始化成功，无法显示（检查是否 root 且 /dev/dri/card0 存在）\n", drm_fd);
+    } else {
+        drmModeCrtcPtr cur = drmModeGetCrtc(drm_fd, g_crtc_id);
+        int already_on = (cur && cur->mode_valid) ? 1 : 0;
+        if (cur) drmModeFreeCrtc(cur);
+        if (!already_on) {
+            if (drmModeSetCrtc(drm_fd, g_crtc_id, gfx_fb[0], 0, 0, &g_conn_id, 1, &g_mode) < 0)
+                fprintf(stderr, "warn: SetCrtc failed: %s (显示可能已由系统接管，SetPlane 仍会叠加)\n", strerror(errno));
+            else
+                printf("crtc enabled: %dx%d@%u\n", g_screen_w, g_screen_h, g_mode.vrefresh);
+        } else {
+            printf("crtc 已激活(沿用系统显示)，跳过 SetCrtc\n");
+        }
+    }
+    if (drm_fd >= 0) {
         int r0 = set_plane_prop(g_gfx_plane_id, "g_alpha_en", 0);
         printf("GFX g_alpha_en -> 0 : %s (逐像素 alpha 启用；框外透出视频)\n",
                r0 == 0 ? "ok" : "failed(框可能不显示!)");
@@ -715,18 +1017,63 @@ int main(int argc, char** argv)
     int frame = 0;
     static int stable = 0, hi_run = 0, lo_run = 0;
     static int32_t last_bx = 0, last_by = 0, last_bw = 0, last_bh = 0;
+    static int32_t sm_bx = 0, sm_by = 0, sm_bw = 0, sm_bh = 0, sm_init = 0;  /* 平滑后的框 */
     static int prev_face = 0;
+    int g_quit = 0;
 
-    struct pollfd pfd[2];
-    pfd[0].fd = g_v0.fd;       pfd[0].events = POLLIN;
-    pfd[1].fd = cap.fd;        pfd[1].events = POLLIN;
-
-    printf("running: detect+display (DPU 每帧, GFX 叠层画框, 去抖=%s)  [Ctrl+C stop]\n",
-           det_off ? "关(DET_OFF)" : "开");
+    struct pollfd pfd[3];
+    pfd[0].fd = g_v0.fd;                        /* video0 显示源（未打开则为 -1，poll 忽略） */
+    pfd[0].events = POLLIN;
+    pfd[1].fd = cap.fd;                        pfd[1].events = POLLIN;
+    int nfd = 2;
+    if (enroll_mode) {
+        if (isatty(0)) {
+            g_enroll_arming = 1; g_enroll_arm_name = enroll_name;
+            fprintf(stderr, "[enroll] 将人脸放入白色框内并居中，对准后按 Enter 开始录入 '%s'（输入 q 取消）...\n", enroll_name.c_str());
+        } else {
+            g_enroll_once = enroll_name;   /* 非交互(重定向)模式：保持原有自动开始 */
+            fprintf(stderr, "[enroll] 非交互模式：检测到稳定人脸后自动录入 '%s'...  (Ctrl+C 取消)\n", enroll_name.c_str());
+        }
+    } else {
+        printf("running: detect+display (DPU 每帧, GFX 叠层画框, 去抖=%s)  [Ctrl+C stop]\n",
+               det_off ? "关(DET_OFF)" : "开");
+        fprintf(stderr, "[enroll] 录入: 在终端输入姓名并回车，对准摄像头即可录入；输入 q 退出程序\n");
+    }
+    if (isatty(0)) { pfd[2].fd = 0; pfd[2].events = POLLIN; nfd = 3; }
     while (!g_stop) {
-        int n = poll(pfd, 2, 1000);
+        int n = poll(pfd, nfd, 1000);
         if (n < 0) { if (errno == EINTR) continue; perror("poll"); break; }
         if (n == 0) continue;
+
+        /* 终端录入：读姓名行 → 置 g_pending_name 触发录入；q 退出 */
+        if (nfd == 3 && (pfd[2].revents & POLLIN)) {
+            static char inbuf[1024]; static size_t inlen = 0;
+            char tmp[256]; ssize_t r = read(0, tmp, sizeof(tmp));
+            if (r > 0) {
+                for (ssize_t i = 0; i < r; i++) {
+                    if (tmp[i] == '\n' || tmp[i] == '\r') {
+                        inbuf[inlen] = 0; inlen = 0;
+                        std::string line(inbuf);
+                        size_t a = line.find_first_not_of(" \t\r\n");
+                        size_t b = line.find_last_not_of(" \t\r\n");
+                        if (a != std::string::npos) line = line.substr(a, b - a + 1);
+                        if (line == "q" || line == "quit" || line == "exit") {
+                            if (g_enroll_arming) { g_enroll_arming = 0; g_enroll_arm_name.clear(); fprintf(stderr, "[enroll] 已取消录入\n"); }
+                            else g_quit = 1;
+                        } else if (g_enroll_arming) {
+                            /* 按 Enter(任意输入) 即开始录入 */
+                            g_enroll_once = g_enroll_arm_name; g_enroll_arming = 0;
+                            g_enroll_n = 0; g_enroll_sum.clear();
+                            fprintf(stderr, "[enroll] 开始录入 '%s'：保持脸在白色框内，采集中... (Ctrl+C 取消)\n", g_enroll_once.c_str());
+                        } else if (!line.empty()) {
+                            g_pending_name = line; g_enroll_n = 0; g_enroll_sum.clear();
+                            fprintf(stderr, "[enroll] 对准摄像头，正在录入 '%s' (中心稳定即可，无需静止)...\n", line.c_str());
+                        }
+                    } else if (inlen < sizeof(inbuf) - 1) inbuf[inlen++] = tmp[i];
+                }
+            }
+        }
+        if (g_quit) break;
 
         /* video1：抓帧 → 预处理+INT8 → 推理 → 解码 → 去抖 → 更新最新框 */
         if (pfd[1].revents & POLLIN) {
@@ -779,25 +1126,29 @@ int main(int argc, char** argv)
                     std::vector<float> tmpF((size_t)Hd * Wd * C);
                     for (size_t i = 0; i < tmpF.size(); i++) tmpF[i] = d8[i] * s;
                     const float* d = tmpF.data();
+                    g_out_C = C;   /* 记录输出通道数，供识别分支判断是否有关键点 */
                     const float CONF = 0.05f;
+                    auto ch = [&](int c, int yy, int xx) -> float {
+                        return nhwc ? d[((size_t)yy*Wd + xx)*C + c]
+                                    : d[((size_t)c*Hd + yy)*Wd + xx];
+                    };
                     for (int y = 0; y < Hd; y++) {
                         for (int x = 0; x < Wd; x++) {
-                            float score = 0, l = 0, t = 0, r = 0, b = 0;
-                            if (nhwc) {
-                                size_t o = ((size_t)y * Wd + x) * C;
-                                score = sigmoidf(d[o + 0]); l = d[o + 1]; t = d[o + 2]; r = d[o + 3]; b = d[o + 4];
-                            } else {
-                                score = sigmoidf(d[(0 * Hd + y) * Wd + x]);
-                                if (score < CONF) continue;
-                                l = d[(1 * Hd + y) * Wd + x]; t = d[(2 * Hd + y) * Wd + x];
-                                r = d[(3 * Hd + y) * Wd + x]; b = d[(4 * Hd + y) * Wd + x];
-                            }
+                            float score = sigmoidf(ch(0, y, x));
                             if (score < CONF) continue;
+                            float l = ch(1, y, x), t = ch(2, y, x), r = ch(3, y, x), b = ch(4, y, x);
                             float cx = (x + 0.5f) * stride, cy = (y + 0.5f) * stride;
                             Det det;
                             det.x1 = cx - l * stride; det.y1 = cy - t * stride;
                             det.x2 = cx + r * stride; det.y2 = cy + b * stride;
-                            det.score = score;
+                            det.score = score; det.has_lmk = 0;
+                            if (C >= 15) {   /* score+4框+10点=15 通道：取 5 关键点 */
+                                for (int kk = 0; kk < 5; kk++) {
+                                    det.lmk[kk][0] = cx + ch(5 + 2*kk, y, x) * stride;
+                                    det.lmk[kk][1] = cy + ch(5 + 2*kk + 1, y, x) * stride;
+                                }
+                                det.has_lmk = 1;
+                            }
                             if (det.x2 > det.x1 && det.y2 > det.y1) dets.push_back(det);
                         }
                     }
@@ -816,8 +1167,75 @@ int main(int argc, char** argv)
                 }
 
                 if (best.score >= 0) { last_bx = bx; last_by = by; last_bw = bw; last_bh = bh; }
+
+                /* 人脸识别：仅在确有把握的人脸(score>=阈值，与绿框同门槛)才跑，避免误检框被认成已知人 */
+                if (best.score >= score_thr) do_recognition(bgr, (int)Msz, (int)Msz, best, dbg);
+
+                /* 录入：name 已设定(--enroll 一次性 / 运行时终端输入)后开始采集。
+                 * 不要求连续帧、不要求绝对静止：累计若干帧(中心漂移不大即可)，平均 embedding 后写入 gallery。
+                 * 注意：录入必须有识别模型(mobilefacenet.onnx)才能提特征。 */
+                if (!g_pending_name.empty() || !g_enroll_once.empty()) {
+                    if (g_rec_net.empty()) {
+                        if (!g_enroll_once.empty()) {
+                            fprintf(stderr, "[enroll] 错误: 录入需要识别模型 %s，请先放置后重试（程序继续以检测模式运行）\n", rec_model.c_str());
+                            g_enroll_once.clear();
+                        } else {
+                            static int w = 0; if (!w) { fprintf(stderr, "[enroll] 错误: 录入需要识别模型(mobilefacenet.onnx)，请先放置\n"); w = 1; }
+                        }
+                    } else if (best.score >= enroll_thr && best.x2 > best.x1 && best.y2 > best.y1) {
+                        /* 用(平滑后的)框中心做稳定基准，比原始抖动框稳得多 */
+                        int cx, cy, bw;
+                        if (smooth_a > 0.0f && sm_init) { cx = sm_bx + sm_bw/2; cy = sm_by + sm_bh/2; bw = sm_bw; }
+                        else { cx = (int)(((best.x1 + best.x2) * 0.5f) * sc); cy = (int)(((best.y1 + best.y2) * 0.5f) * sc); bw = (int)((best.x2 - best.x1) * sc); }
+                        /* 误检过滤：人脸框尺寸须合理（太小=噪声/太远，太大=异常）；模型有关键点时要求 5 关键点落在框内 */
+                        int bw_ok  = (bw >= (int)(0.12f * CAM0_W) && bw <= (int)(0.70f * CAM0_W));
+                        int lmk_ok = (g_out_C < 15) ? 1 : (lmk_in_box(best) ? 1 : 0);
+                        /* 人脸须在录入目标区(屏幕中央)内才采集；否则提示并把脸移过去，重置累计 */
+                        int in_roi = (cx >= ENROLL_ROI_X0 && cx <= ENROLL_ROI_X0 + ENROLL_ROI_W &&
+                                      cy >= ENROLL_ROI_Y0 && cy <= ENROLL_ROI_Y0 + ENROLL_ROI_H);
+                        if (!bw_ok || !lmk_ok) {
+                            static int bad_w = 0;
+                            if (frame - bad_w > 30) { fprintf(stderr, "[enroll] 检测框不像人脸(尺寸/关键点异常)，已忽略；请正脸对准镜头\n"); bad_w = frame; }
+                            g_enroll_n = 0; g_enroll_sum.clear();
+                        } else if (!in_roi) {
+                            static int roi_w = 0;
+                            if (frame - roi_w > 30) { fprintf(stderr, "[enroll] 请把人脸移到屏幕中央白色框内再录入(当前位置偏了)\n"); roi_w = frame; }
+                            g_enroll_n = 0; g_enroll_sum.clear();
+                        } else {
+                            /* 超时复位：>3s 没采到有效帧则重新开始累计（frame 约 30fps → 90帧） */
+                            if (g_enroll_n > 0 && (frame - g_enroll_last) > 90) { g_enroll_n = 0; g_enroll_sum.clear(); }
+                            if (g_enroll_n == 0) {       /* 首次/复位：建立中心基准 */
+                                g_enroll_cx = cx; g_enroll_cy = cy; g_enroll_refbw = bw; g_enroll_sum.clear();
+                            } else {                      /* 中心漂移过大 → 视为换脸/大幅移动，复位 */
+                                int d = (int)sqrt((double)(cx-g_enroll_cx)*(cx-g_enroll_cx) + (double)(cy-g_enroll_cy)*(cy-g_enroll_cy));
+                                int tol = (int)(0.4f * (g_enroll_refbw > 0 ? g_enroll_refbw : 200)) + 8;
+                                if (d > tol) { g_enroll_n = 0; g_enroll_sum.clear(); g_enroll_cx = cx; g_enroll_cy = cy; g_enroll_refbw = bw; }
+                            }
+                            std::vector<float> efv = compute_embedding(bgr, (int)Msz, (int)Msz, best);
+                            if (!efv.empty()) {
+                                if (g_enroll_sum.empty()) g_enroll_sum = efv;
+                                else for (size_t i = 0; i < efv.size(); i++) g_enroll_sum[i] += efv[i];
+                                g_enroll_n++; g_enroll_last = frame;
+                                fprintf(stderr, "[enroll] 采集中 %d/5 (中心稳定即可，无需静止)\n", g_enroll_n);
+                                if (g_enroll_n >= 5) {
+                                    for (float& v : g_enroll_sum) v /= g_enroll_n;
+                                    std::string nm = g_enroll_once.empty() ? g_pending_name : g_enroll_once;
+                                    enroll_face(nm, g_enroll_sum);
+                                    fprintf(stderr, "[enroll] 已录入 '%s'，程序继续以检测+识别模式运行（Ctrl+C 退出；同人再出现将显示 label）\n", nm.c_str());
+                                    g_pending_name.clear(); g_enroll_once.clear(); g_enroll_n = 0; g_enroll_sum.clear();
+                                }
+                            }
+                        }
+                    }
+                    /* 无人脸帧：不累计也不复位（等待下一帧） */
+                }
+                if (g_out_C > 0 && g_out_C < 15) {
+                    static int w = 0;
+                    if (!w) { fprintf(stderr, "[rec] 检测模型输出通道=%d(<15)，未含5关键点，识别已跳过\n", g_out_C); w = 1; }
+                }
                 if (det_off) {
-                    stable = (best.score >= score_thr) ? 1 : 0;   /* 关去抖：直接按阈值开关 */
+                    /* 关去抖：当帧直接判定，但仍受 score_thr 控制（FACE_THR 生效） */
+                    stable = (best.score >= score_thr) ? 1 : 0;
                     hi_run = lo_run = 0;
                 } else {
                     if (best.score >= score_thr) { hi_run++; lo_run = 0; }
@@ -826,7 +1244,32 @@ int main(int argc, char** argv)
                     if (stable && lo_run >= n_lost) stable = 0;
                 }
                 int detected = stable;
-                if (detected) { g_bx = last_bx; g_by = last_by; g_bw = last_bw; g_bh = last_bh; }
+                if (!detected) g_rec_printed.clear();   /* 人脸确实丢失：复位识别播报，下次同人重现会重新打印 */
+                /* 框时间平滑：EMA + 每帧限幅。
+                 * EMA 压小抖动；限幅防止"原始框突然远跳/误检"导致显示框大幅漂移或瞬移。 */
+                if (best.score >= score_thr && smooth_a > 0.0f) {
+                    if (!sm_init) { sm_bx = bx; sm_by = by; sm_bw = bw; sm_bh = bh; sm_init = 1; }
+                    else {
+                        float nbx = smooth_a * bx + (1.0f - smooth_a) * sm_bx;
+                        float nby = smooth_a * by + (1.0f - smooth_a) * sm_by;
+                        float nbw = smooth_a * bw + (1.0f - smooth_a) * sm_bw;
+                        float nbh = smooth_a * bh + (1.0f - smooth_a) * sm_bh;
+                        int base = sm_bw > 0 ? sm_bw : 200;
+                        int maxmv = (int)(0.12f * base) + 4;   /* 每帧中心最多移动 ~12% 框宽 */
+                        int maxgw = (int)(0.12f * base) + 4;   /* 每帧尺寸最多变化 ~12% 框宽 */
+                        int d;
+                        d = (int)nbx - sm_bx; if (d > maxmv) d = maxmv; else if (d < -maxmv) d = -maxmv; sm_bx += d;
+                        d = (int)nby - sm_by; if (d > maxmv) d = maxmv; else if (d < -maxmv) d = -maxmv; sm_by += d;
+                        d = (int)nbw - sm_bw; if (d > maxgw) d = maxgw; else if (d < -maxgw) d = -maxgw; sm_bw += d;
+                        d = (int)nbh - sm_bh; if (d > maxgw) d = maxgw; else if (d < -maxgw) d = -maxgw; sm_bh += d;
+                    }
+                }
+                if (detected) {
+                    if (smooth_a > 0.0f && sm_init) { g_bx = sm_bx; g_by = sm_by; g_bw = sm_bw; g_bh = sm_bh; }
+                    else { g_bx = last_bx; g_by = last_by; g_bw = last_bw; g_bh = last_bh; }
+                } else {
+                    sm_init = 0;   /* 完全消失后复位，下次出现直接对齐避免残影拖移 */
+                }
                 g_detected = detected;
 
                 int has_face = detected;
@@ -865,6 +1308,12 @@ int main(int argc, char** argv)
         }
     }
 
+    if (enroll_mode) {
+        if (g_enrolled_ok > 0)
+            fprintf(stderr, "录入完成：%s（已写入 %s，共 %d 人）\n", enroll_name.c_str(), g_gallery_path.c_str(), g_enrolled_ok);
+        else
+            fprintf(stderr, "未录入：未检测到稳定人脸，已取消（gallery 未改动）\n");
+    }
     printf("face_detect_dpu 退出\n");
     return 0;
 }
